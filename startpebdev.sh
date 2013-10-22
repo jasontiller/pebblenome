@@ -30,4 +30,12 @@ if [ ! -e wscript ]; then
     ln -s $PEB_SDK/wscript wscript
 fi
 
+if [ ! -e resources ]; then
+    mkdir resources
+fi
+
+if [ ! -e resources/wscript ]; then
+    ln -s $PEB_SDK/resources/wscript resources/wscript
+fi
+
 PATH=$PEB_ROOT/arm-cs-tools/bin:$PATH bash
