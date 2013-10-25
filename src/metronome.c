@@ -9,7 +9,7 @@
 #define MY_UUID { 0xA6, 0x42, 0xF2, 0xC8, 0x2D, 0x04, 0x42, 0x97, 0xA0, 0x31, 0xEB, 0xD6, 0x61, 0x76, 0x16, 0x2B }
 PBL_APP_INFO(MY_UUID,
              "Metronome", "Jason Tiller",
-             0, 2, /* App version */
+             0, 3, /* App version */
              DEFAULT_MENU_ICON,
              APP_INFO_STANDARD_APP);
 
@@ -316,7 +316,7 @@ void vibe_dur_win_init( void )
    layer_add_child( &vibe_dur_win.layer, &vibe_dur_lay.layer );
  }
 
-////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////   
 
 void vibe_dur_selected( int index, void* context )
 {
@@ -341,6 +341,289 @@ void vibe_active_selected( int index, void* context )
    menu_items[index].subtitle =
       vibe_enabled ? "Enabled" : "Disabled";
    layer_mark_dirty( (Layer*) &menu_lay );
+}
+
+////////////////////////////////////////////////////////////////////////
+Window find_tempo_win;
+
+TextLayer find_tempo_title_lay;
+InverterLayer find_tempo_title_inverter_lay;
+char find_tempo_title_str[] = "Find Tempo";
+
+TextLayer tap_butt_lay;
+char tap_butt_str[] = "tap";
+
+TextLayer use_butt_lay;
+char use_butt_str[] = "use";
+
+uint8_t curr_tempo;
+uint8_t avg_tempo;
+
+volatile uint16_t num_10ms_ticks;
+
+TextLayer curr_tempo_lay;
+TextLayer avg_tempo_lay;
+
+TextLayer curr_tempo_name_lay;
+TextLayer avg_tempo_name_lay;
+char curr_tempo_name_str[] = "last";
+char avg_tempo_name_str[] = "avg";
+char curr_tempo_str[4];
+char avg_tempo_str[4];
+
+TextLayer measuring_lay;
+InverterLayer measuring_inverter_lay;
+char measuring_active_str[] = "active";
+char measuring_inactive_str[] = "inactive";
+
+uint8_t num_taps;
+#define MAX_TAPS (4)
+uint32_t tap_times[MAX_TAPS];
+
+AppTimerHandle stop_measuring_timer;
+#define STOP_MEASURING_TIMEOUT (2000)
+
+#define TIM5_CR1 (*(volatile uint32_t*) 0x40000C00)
+#define TIM5_CR2 (*(volatile uint32_t*) 0x40000C04)
+#define TIM5_SR  (*(volatile uint32_t*) 0x40000C10)
+#define TIM5_EGR (*(volatile uint32_t*) 0x40000C14)
+#define TIM5_CNT (*(volatile uint32_t*) 0x40000C24)
+#define TIM5_PSC (*(volatile uint32_t*) 0x40000C28)
+#define TIM5_ARR (*(volatile uint32_t*) 0x40000C2C)
+
+#define RCC_APB1ENR (*(volatile uint32_t*) 0x40023840)
+#define RCC_APB1LPENR (*(volatile uint32_t*) 0x40023860)
+// Bit 4 (TIM6), Bit 3 (TIM5)
+
+
+uint8_t measuring_tempo;
+
+bool handle_tempo_tap_timers( AppContextRef app_ctx,
+                              AppTimerHandle handle,
+                              uint32_t cookie )
+{
+   if( handle == stop_measuring_timer ) {
+      text_layer_set_text( &measuring_lay, measuring_inactive_str );
+      layer_set_hidden( (Layer*) &measuring_inverter_lay, true );
+      measuring_tempo = false;
+   } else {
+      return false;
+   }
+
+   return true;
+}
+
+void handle_tempo_tap( ClickRecognizerRef recognizer,
+                       Window* win )
+{
+   if( measuring_tempo ) {
+      // This is in 1ms units.
+      uint32_t val = TIM5_CNT;
+      // Push num ticks, calc curr and avg tempo.
+      if( num_taps < MAX_TAPS ) {
+         tap_times[num_taps++] = val ;
+      } else {
+         uint16_t diff_sum = 0;
+         uint16_t diff_avg;
+         for( int t = 1; t < MAX_TAPS; t++ ) {
+            diff_sum += tap_times[t] - tap_times[t-1];
+            tap_times[t-1] = tap_times[t];
+         }
+         tap_times[MAX_TAPS-1] = val;
+         diff_sum += tap_times[num_taps-1] - tap_times[num_taps-2];
+         diff_avg = diff_sum / 4;
+         avg_tempo = 60000 / diff_avg;
+         snprintf( avg_tempo_str, 4, "%d", avg_tempo );
+         text_layer_set_text( &avg_tempo_lay, avg_tempo_str );
+      }
+      if( num_taps > 1 ) {
+         uint16_t diff = tap_times[num_taps-1] - tap_times[num_taps-2];
+         curr_tempo = 60000 / diff;
+         snprintf( curr_tempo_str, 4, "%d", curr_tempo );
+         text_layer_set_text( &curr_tempo_lay, curr_tempo_str );
+      }
+   } else {
+      num_taps = 0;
+      tap_times[num_taps++] = 0;
+      text_layer_set_text( &measuring_lay, measuring_active_str );
+      layer_set_hidden( (Layer*) &measuring_inverter_lay, false );
+      memset( tap_times, 0, ARRAY_LENGTH(tap_times) * sizeof(uint32_t) );
+      measuring_tempo = true;
+   }
+
+   stop_measuring_timer = app_timer_send_event( my_ctx,
+                                                STOP_MEASURING_TIMEOUT,
+                                                0 );
+}
+
+// We use a hardware-supplied timer module for the "find tempo"
+// processing.  PebbleOS 1.12.1 doesn't provide any kind of
+// high-resolution timer/counter facility, so we have no accurate way
+// of measuring time.
+//
+// I tried setting up a timer to run at 10ms and just count
+// ticks... but this was incredibly inaccurate and noisy.  Using TIM5,
+// a 32-bit counter, is much better.
+void find_tempo_win_appear( Window* win )
+{
+   measuring_tempo = false;
+   // Have to enable power to TIM5 in the RCC subsystem.
+   uint32_t val = RCC_APB1ENR;
+   RCC_APB1ENR = val | ( 0b1 << 3 );
+   // We also enable it in low-power (sleep) mode.
+   val = RCC_APB1LPENR;
+   RCC_APB1LPENR = val | ( 0b1 << 3 );
+   // Enable the counter and count up.
+   TIM5_CR1 = 0x00000005;
+   // Divide clkin by 32768.  TIM5 counts at 1kHz
+   TIM5_PSC = 0x00007FFF;
+   // Reload at 0xFFFFFFFF.
+   TIM5_ARR = 0xFFFFFFFF;
+   // Just to be safe.
+   TIM5_CR2 = 0;
+   // Force an update.
+   val = TIM5_EGR;
+   TIM5_EGR = val | ( 0b1 << 0 );
+   timer_stack_push( &handle_tempo_tap_timers );
+}
+
+void find_tempo_win_disappear( Window* win )
+{
+   if( measuring_tempo ) {
+      app_timer_cancel_event( my_ctx, stop_measuring_timer );
+   }
+   // Disable the hardware counter and power it down.
+   TIM5_CR1 = 0x00000000;
+   uint32_t val = RCC_APB1ENR;
+   RCC_APB1ENR = val & ( ~ (0b1 << 3 ) );
+   val = RCC_APB1LPENR;
+   RCC_APB1LPENR = val & ( ~ ( 0b1 << 3 ) );
+   timer_stack_pop();
+}
+
+void use_this_tempo_handler( ClickRecognizerRef recognizer,
+                             Window* win )
+{
+   tempo = avg_tempo;
+   snprintf( tempo_str, 4, "%d", tempo );
+   layer_mark_dirty( &tempo_layer.layer );
+   window_stack_pop( true );
+}
+
+
+void find_tempo_win_config_click_provider( ClickConfig** config,
+                                           Window* window )
+{
+   config[BUTTON_ID_DOWN]->raw.down_handler =
+      (ClickHandler) &handle_tempo_tap;
+
+   config[BUTTON_ID_SELECT]->click.handler =
+      (ClickHandler) &use_this_tempo_handler;
+}
+
+void find_tempo_win_init( void )
+{
+   window_init( &find_tempo_win, "Find Tempo" );
+
+   window_set_click_config_provider( 
+      &find_tempo_win,
+      (ClickConfigProvider) &find_tempo_win_config_click_provider );
+
+   find_tempo_win.window_handlers.appear =
+      (WindowHandler) find_tempo_win_appear;
+   find_tempo_win.window_handlers.disappear =
+      (WindowHandler) find_tempo_win_disappear;
+
+   text_layer_init( &find_tempo_title_lay,
+                    GRect( 0, 0, SCREEN_WIDTH, 28 ) );
+   text_layer_set_font( &find_tempo_title_lay,
+                        fonts_get_system_font( FONT_KEY_ROBOTO_CONDENSED_21 ) );
+   text_layer_set_text_alignment( &find_tempo_title_lay,
+                                  GTextAlignmentCenter );
+   text_layer_set_text( &find_tempo_title_lay, find_tempo_title_str );
+   layer_add_child( &find_tempo_win.layer, &find_tempo_title_lay.layer );
+
+   inverter_layer_init( &find_tempo_title_inverter_lay,
+                        GRect( 0, 0, SCREEN_WIDTH, 30 ) );
+   layer_add_child( &find_tempo_win.layer,
+                    (Layer*) &find_tempo_title_inverter_lay );
+
+   text_layer_init( &tap_butt_lay,
+                    GRect( SCREEN_WIDTH - 32, SCREEN_HEIGHT - 25,
+                           30, 25 ) );
+   text_layer_set_font( &tap_butt_lay,
+                        fonts_get_system_font( FONT_KEY_ROBOTO_CONDENSED_21 ) );
+   text_layer_set_text_alignment( &tap_butt_lay,
+                                  GTextAlignmentRight );
+   text_layer_set_text( &tap_butt_lay, tap_butt_str );
+   layer_add_child( &find_tempo_win.layer, &tap_butt_lay.layer );
+
+   text_layer_init( &use_butt_lay,
+                    GRect( SCREEN_WIDTH - 32, SCREEN_HEIGHT / 2 - 5,
+                           30, 25 ) );
+   text_layer_set_font( &use_butt_lay,
+                        fonts_get_system_font( FONT_KEY_ROBOTO_CONDENSED_21 ) );
+   text_layer_set_text_alignment( &use_butt_lay,
+                                  GTextAlignmentRight );
+   text_layer_set_text( &use_butt_lay, use_butt_str );
+   layer_add_child( &find_tempo_win.layer, &use_butt_lay.layer );
+
+   text_layer_init( &curr_tempo_lay,
+                    GRect( 10, 30,
+                           70, 30 ) );
+   text_layer_set_font( &curr_tempo_lay,
+                        fonts_get_system_font( FONT_KEY_BITHAM_30_BLACK ) );
+   text_layer_set_text_alignment( &curr_tempo_lay,
+                                  GTextAlignmentRight );
+   text_layer_set_text( &curr_tempo_lay, "100" );
+   layer_add_child( &find_tempo_win.layer, &curr_tempo_lay.layer );
+
+   text_layer_init( &curr_tempo_name_lay,
+                    GRect( 80, 42,
+                           30, 18 ) );
+   text_layer_set_font( &curr_tempo_name_lay,
+                        fonts_get_system_font( FONT_KEY_GOTHIC_18_BOLD ) );
+   text_layer_set_text_alignment( &curr_tempo_name_lay,
+                                  GTextAlignmentCenter );
+   text_layer_set_text( &curr_tempo_name_lay, curr_tempo_name_str );
+   layer_add_child( &find_tempo_win.layer, &curr_tempo_name_lay.layer );
+
+   text_layer_init( &avg_tempo_lay,
+                    GRect( 10, 70,
+                           70, 30 ) );
+   text_layer_set_font( &avg_tempo_lay,
+                        fonts_get_system_font( FONT_KEY_BITHAM_30_BLACK ) );
+   text_layer_set_text_alignment( &avg_tempo_lay,
+                                  GTextAlignmentRight );
+   text_layer_set_text( &avg_tempo_lay, "100" );
+   layer_add_child( &find_tempo_win.layer, &avg_tempo_lay.layer );
+
+   text_layer_init( &avg_tempo_name_lay,
+                    GRect( 80, 82,
+                           30, 21 ) );
+   text_layer_set_font( &avg_tempo_name_lay,
+                        fonts_get_system_font( FONT_KEY_GOTHIC_18_BOLD ) );
+   text_layer_set_text_alignment( &avg_tempo_name_lay,
+                                  GTextAlignmentCenter );
+   text_layer_set_text( &avg_tempo_name_lay, avg_tempo_name_str );
+   layer_add_child( &find_tempo_win.layer, &avg_tempo_name_lay.layer );
+
+   text_layer_init( &measuring_lay,
+                    GRect( 20, 110,
+                           65, 28 ) );
+   text_layer_set_font( &measuring_lay,
+                        fonts_get_system_font( FONT_KEY_GOTHIC_24_BOLD ) );
+   text_layer_set_text_alignment( &measuring_lay,
+                                  GTextAlignmentCenter );
+   text_layer_set_text( &measuring_lay, measuring_inactive_str );
+   layer_add_child( &find_tempo_win.layer, &measuring_lay.layer );
+
+   inverter_layer_init( &measuring_inverter_lay,
+                        GRect( 20, 114,
+                               65, 24 ) );
+   layer_add_child( &find_tempo_win.layer,
+                    (Layer*) &measuring_inverter_lay );
+   layer_set_hidden( (Layer*) &measuring_inverter_lay, true );
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -443,6 +726,11 @@ bool handle_beat_timeout( AppContextRef app_ctx,
    return true;
 }
 
+void handle_double_click( ClickRecognizerRef recognizer,
+                          Window* win )
+{
+   window_stack_push( &find_tempo_win, true );
+}
 
 void config_click_provider( ClickConfig** config,
                             Window* window )
@@ -452,6 +740,13 @@ void config_click_provider( ClickConfig** config,
    config[BUTTON_ID_SELECT]->long_click.handler =
       (ClickHandler) &switch_to_menu;
    config[BUTTON_ID_SELECT]->long_click.delay_ms = 500;
+
+   config[BUTTON_ID_SELECT]->multi_click.handler =
+      (ClickHandler) &handle_double_click;
+   config[BUTTON_ID_SELECT]->multi_click.min = 2;
+   config[BUTTON_ID_SELECT]->multi_click.min = 2;
+   config[BUTTON_ID_SELECT]->multi_click.last_click_only = true;
+   config[BUTTON_ID_SELECT]->multi_click.timeout = 200;
 }
 
 void metronome_win_appear( Window* win )
@@ -624,6 +919,8 @@ void handle_init(AppContextRef ctx)
 
   stop_after_win_init();
 
+  find_tempo_win_init();
+
   timer_stack_init_once();
 
   spinner_init_once();
@@ -638,7 +935,7 @@ void pbl_main(void *params) {
   };
   tempo = 96;
   min_tempo = 48;
-  max_tempo = 216;
+  max_tempo = 208;
   running = 0;
   vibe_enabled = 1;
   app_event_loop(params, &handlers);
