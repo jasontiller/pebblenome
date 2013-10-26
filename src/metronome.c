@@ -1,5 +1,6 @@
 #include "timer_stack.h"
 #include "spinner.h"
+#include "hw_timer.h"
 #include "pebble_os.h"
 #include "pebble_app.h"
 #include "pebble_fonts.h"
@@ -359,8 +360,6 @@ char use_butt_str[] = "use";
 uint8_t curr_tempo;
 uint8_t avg_tempo;
 
-volatile uint16_t num_10ms_ticks;
-
 TextLayer curr_tempo_lay;
 TextLayer avg_tempo_lay;
 
@@ -376,25 +375,13 @@ InverterLayer measuring_inverter_lay;
 char measuring_active_str[] = "active";
 char measuring_inactive_str[] = "inactive";
 
-uint8_t num_taps;
-#define MAX_TAPS (4)
-uint32_t tap_times[MAX_TAPS];
+uint8_t num_tap_intervals;
+uint32_t last_tap_time;
+#define MAX_TAP_INTERVALS (4)
+uint32_t tap_intervals[MAX_TAP_INTERVALS];
 
 AppTimerHandle stop_measuring_timer;
 #define STOP_MEASURING_TIMEOUT (2000)
-
-#define TIM5_CR1 (*(volatile uint32_t*) 0x40000C00)
-#define TIM5_CR2 (*(volatile uint32_t*) 0x40000C04)
-#define TIM5_SR  (*(volatile uint32_t*) 0x40000C10)
-#define TIM5_EGR (*(volatile uint32_t*) 0x40000C14)
-#define TIM5_CNT (*(volatile uint32_t*) 0x40000C24)
-#define TIM5_PSC (*(volatile uint32_t*) 0x40000C28)
-#define TIM5_ARR (*(volatile uint32_t*) 0x40000C2C)
-
-#define RCC_APB1ENR (*(volatile uint32_t*) 0x40023840)
-#define RCC_APB1LPENR (*(volatile uint32_t*) 0x40023860)
-// Bit 4 (TIM6), Bit 3 (TIM5)
-
 
 uint8_t measuring_tempo;
 
@@ -418,36 +405,38 @@ void handle_tempo_tap( ClickRecognizerRef recognizer,
 {
    if( measuring_tempo ) {
       // This is in 1ms units.
-      uint32_t val = TIM5_CNT;
+      uint32_t tap_time = hw_timer_get_time();
+      uint32_t tap_interval = tap_time - last_tap_time;
+      last_tap_time = tap_time;
       // Push num ticks, calc curr and avg tempo.
-      if( num_taps < MAX_TAPS ) {
-         tap_times[num_taps++] = val ;
+      if( num_tap_intervals < MAX_TAP_INTERVALS ) {
+         tap_intervals[num_tap_intervals++] = tap_interval;
       } else {
-         uint16_t diff_sum = 0;
-         uint16_t diff_avg;
-         for( int t = 1; t < MAX_TAPS; t++ ) {
-            diff_sum += tap_times[t] - tap_times[t-1];
-            tap_times[t-1] = tap_times[t];
+         uint32_t sum = tap_intervals[0];
+         uint32_t avg;
+         for( int t = 1; t < MAX_TAP_INTERVALS; t++ ) {
+            sum += tap_intervals[t];
+            tap_intervals[t-1] = tap_intervals[t];
          }
-         tap_times[MAX_TAPS-1] = val;
-         diff_sum += tap_times[num_taps-1] - tap_times[num_taps-2];
-         diff_avg = diff_sum / 4;
-         avg_tempo = 60000 / diff_avg;
+         tap_intervals[MAX_TAP_INTERVALS-1] = tap_interval;
+         avg = sum / 4;
+         avg_tempo = 60000 / avg;
          snprintf( avg_tempo_str, 4, "%d", avg_tempo );
          text_layer_set_text( &avg_tempo_lay, avg_tempo_str );
       }
-      if( num_taps > 1 ) {
-         uint16_t diff = tap_times[num_taps-1] - tap_times[num_taps-2];
-         curr_tempo = 60000 / diff;
+      if( num_tap_intervals > 1 ) {
+         curr_tempo = 60000 / tap_interval;
          snprintf( curr_tempo_str, 4, "%d", curr_tempo );
          text_layer_set_text( &curr_tempo_lay, curr_tempo_str );
       }
    } else {
-      num_taps = 0;
-      tap_times[num_taps++] = 0;
+      num_tap_intervals = 0;
+      hw_timer_start();
+      last_tap_time = hw_timer_get_time();
       text_layer_set_text( &measuring_lay, measuring_active_str );
       layer_set_hidden( (Layer*) &measuring_inverter_lay, false );
-      memset( tap_times, 0, ARRAY_LENGTH(tap_times) * sizeof(uint32_t) );
+      memset( tap_intervals, 0,
+              ARRAY_LENGTH(tap_intervals) * sizeof(*tap_intervals) );
       measuring_tempo = true;
    }
 
@@ -467,23 +456,7 @@ void handle_tempo_tap( ClickRecognizerRef recognizer,
 void find_tempo_win_appear( Window* win )
 {
    measuring_tempo = false;
-   // Have to enable power to TIM5 in the RCC subsystem.
-   uint32_t val = RCC_APB1ENR;
-   RCC_APB1ENR = val | ( 0b1 << 3 );
-   // We also enable it in low-power (sleep) mode.
-   val = RCC_APB1LPENR;
-   RCC_APB1LPENR = val | ( 0b1 << 3 );
-   // Enable the counter and count up.
-   TIM5_CR1 = 0x00000005;
-   // Divide clkin by 32768.  TIM5 counts at 1kHz
-   TIM5_PSC = 0x00007FFF;
-   // Reload at 0xFFFFFFFF.
-   TIM5_ARR = 0xFFFFFFFF;
-   // Just to be safe.
-   TIM5_CR2 = 0;
-   // Force an update.
-   val = TIM5_EGR;
-   TIM5_EGR = val | ( 0b1 << 0 );
+   hw_timer_init( 1000 );
    timer_stack_push( &handle_tempo_tap_timers );
 }
 
@@ -492,12 +465,7 @@ void find_tempo_win_disappear( Window* win )
    if( measuring_tempo ) {
       app_timer_cancel_event( my_ctx, stop_measuring_timer );
    }
-   // Disable the hardware counter and power it down.
-   TIM5_CR1 = 0x00000000;
-   uint32_t val = RCC_APB1ENR;
-   RCC_APB1ENR = val & ( ~ (0b1 << 3 ) );
-   val = RCC_APB1LPENR;
-   RCC_APB1LPENR = val & ( ~ ( 0b1 << 3 ) );
+   hw_timer_deinit();
    timer_stack_pop();
 }
 
